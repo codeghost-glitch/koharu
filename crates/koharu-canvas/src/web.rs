@@ -11,9 +11,9 @@ use std::{
 use futures_channel::oneshot;
 use js_sys::{Array, Function, Uint8Array};
 use koharu_rasterizer::{
-    CompositionCommand, Frame as PreparedFrame, GpuCompositor, LayerId, LayerKind, PreparedContent,
-    PreparedFrameManifest, PreparedRasterTile, PreparedResource, PreparedResourcePacket,
-    PreparedResourceStore, Presentation, RasterDraw, ResourceId, Revision,
+    CompositionCommand, DecodedRaster, Frame as PreparedFrame, GpuCompositor, LayerId, LayerKind,
+    PreparedContent, PreparedFrameManifest, PreparedRasterTile, PreparedResource,
+    PreparedResourcePacket, PreparedResourceStore, Presentation, RasterDraw, ResourceId, Revision,
 };
 use serde::{Deserialize, Serialize};
 use vello::{
@@ -25,8 +25,8 @@ use vello::{
 use wasm_bindgen::{JsCast as _, prelude::*};
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    Blob, BlobPropertyBag, ColorSpaceConversion, HtmlCanvasElement, ImageBitmap,
-    ImageBitmapOptions, ImageOrientation, PremultiplyAlpha, Window,
+    Blob, BlobPropertyBag, CanvasRenderingContext2d, ColorSpaceConversion, HtmlCanvasElement,
+    ImageBitmap, ImageBitmapOptions, ImageOrientation, PremultiplyAlpha, Window,
 };
 
 use crate::{cache::ResourceUsage, surface::SurfaceBlitter};
@@ -271,6 +271,9 @@ struct CanvasRenderer {
     target: RenderTarget,
     sample: Option<PendingSample>,
     wake: Arc<AtomicBool>,
+    /// `false` on adapters that cannot take browser images directly, so decoded
+    /// rasters are read back on the CPU and uploaded with `Queue::write_texture`.
+    external_texture_copies: bool,
 }
 
 impl CanvasRenderer {
@@ -279,6 +282,7 @@ impl CanvasRenderer {
         queue: Rc<wgpu::Queue>,
         size: PhysicalSize,
         wake: Arc<AtomicBool>,
+        external_texture_copies: bool,
     ) -> Result<Self, JsValue> {
         let vello = vello::Renderer::new(
             &device,
@@ -298,6 +302,7 @@ impl CanvasRenderer {
             target,
             sample: None,
             wake,
+            external_texture_copies,
         })
     }
 
@@ -435,17 +440,16 @@ impl CanvasRenderer {
         &mut self,
         source: ResourceId,
         source_size: (u32, u32),
-        bitmap: &ImageBitmap,
+        raster: &DecodedRaster,
         tiles: &[PreparedRasterTile],
     ) -> Result<(), JsValue> {
-        let image = wgpu::ExternalImageSource::ImageBitmap(bitmap.clone());
         self.compositor
             .cache_external_raster(
                 &self.device,
                 &self.queue,
                 source,
                 source_size,
-                &image,
+                raster,
                 tiles,
             )
             .map_err(js_error)
@@ -588,8 +592,15 @@ impl CanvasState {
                         "encoded raster resource has no staged tile crops",
                     ));
                 }
+                let raster = if self.gpu.external_texture_copies {
+                    DecodedRaster::External(wgpu::ExternalImageSource::ImageBitmap(
+                        bitmap.clone(),
+                    ))
+                } else {
+                    read_raster_pixels(bitmap)?
+                };
                 self.gpu
-                    .cache_external_raster(expected, (*width, *height), bitmap, &tiles)?;
+                    .cache_external_raster(expected, (*width, *height), &raster, &tiles)?;
             }
         }
         let _ = self.resources.insert(resource);
@@ -894,6 +905,48 @@ impl CanvasState {
     }
 }
 
+/// Read a decoded image back as premultiplied RGBA8 pixels for adapters that lack
+/// external texture copies. `Queue::write_texture` treats input as premultiplied,
+/// so the bytes are converted to match the `premultiplied_alpha: true` upload
+/// used for browser images.
+fn read_raster_pixels(bitmap: &ImageBitmap) -> Result<DecodedRaster, JsValue> {
+    let width = bitmap.width();
+    let height = bitmap.height();
+    let document = web_sys::window()
+        .ok_or_else(|| js_message("no window for reading raster pixels"))?
+        .document()
+        .ok_or_else(|| js_message("no document for reading raster pixels"))?;
+    let scratch: HtmlCanvasElement = document
+        .create_element("canvas")
+        .map_err(js_error)?
+        .dyn_into()
+        .map_err(|_| js_message("scratch element is not a canvas"))?;
+    scratch.set_width(width.max(1));
+    scratch.set_height(height.max(1));
+    let context = scratch
+        .get_context("2d")
+        .map_err(js_error)?
+        .ok_or_else(|| js_message("scratch canvas has no 2d context"))?
+        .dyn_into::<CanvasRenderingContext2d>()
+        .map_err(|_| js_message("scratch 2d context is not a CanvasRenderingContext2d"))?;
+    context.draw_image_with_image_bitmap(bitmap, 0.0, 0.0)?;
+    let image = context.get_image_data(0.0, 0.0, f64::from(width), f64::from(height))?;
+    let source = image.data().to_vec();
+    let mut pixels = Vec::with_capacity(source.len());
+    for rgba in source.chunks_exact(4) {
+        let alpha = u16::from(rgba[3]);
+        for channel in &rgba[..3] {
+            pixels.push(((u16::from(*channel) * alpha + 127) / 255) as u8);
+        }
+        pixels.push(rgba[3]);
+    }
+    Ok(DecodedRaster::Pixels {
+        width,
+        height,
+        data: pixels,
+    })
+}
+
 fn raster_tiles_for_source(
     manifest: &PreparedFrameManifest,
     source: ResourceId,
@@ -1109,15 +1162,12 @@ pub async fn create_canvas(element: HtmlCanvasElement) -> Result<WebCanvas, JsVa
         })
         .await
         .map_err(js_error)?;
-    if !adapter
+    // Adapters without unrestricted external texture copies still work: decoded
+    // rasters are read back on the CPU and uploaded with `Queue::write_texture`.
+    let external_texture_copies = adapter
         .get_downlevel_capabilities()
         .flags
-        .contains(wgpu::DownlevelFlags::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES)
-    {
-        return Err(js_message(
-            "WebGPU adapter cannot upload premultiplied raster tile crops",
-        ));
-    }
+        .contains(wgpu::DownlevelFlags::UNRESTRICTED_EXTERNAL_TEXTURE_COPIES);
     let (device, queue) = adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: Some("koharu browser WebGPU device"),
@@ -1142,6 +1192,7 @@ pub async fn create_canvas(element: HtmlCanvasElement) -> Result<WebCanvas, JsVa
         Rc::clone(&queue),
         initial_size,
         Arc::clone(&wake),
+        external_texture_copies,
     )?;
     let browser = BrowserGpu {
         _instance: instance,

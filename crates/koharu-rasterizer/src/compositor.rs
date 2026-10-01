@@ -137,6 +137,21 @@ impl ScratchTarget {
     }
 }
 
+/// Browser-decoded raster pixels, in whichever form the WebGPU adapter accepts.
+#[cfg(target_arch = "wasm32")]
+pub enum DecodedRaster {
+    /// The adapter supports unrestricted external texture copies, so the browser
+    /// image goes straight to the GPU.
+    External(wgpu::ExternalImageSource),
+    /// Fallback for adapters without external texture copies: premultiplied RGBA8
+    /// pixels the CPU already holds, uploaded with `Queue::write_texture`.
+    Pixels {
+        width: u32,
+        height: u32,
+        data: Vec<u8>,
+    },
+}
+
 pub struct GpuCompositor {
     pipeline: wgpu::RenderPipeline,
     bind_group_layout: wgpu::BindGroupLayout,
@@ -270,16 +285,30 @@ impl GpuCompositor {
         queue: &wgpu::Queue,
         source: ResourceId,
         source_size: (u32, u32),
-        image: &wgpu::ExternalImageSource,
+        image: &DecodedRaster,
         tiles: &[PreparedRasterTile],
     ) -> Result<()> {
-        if (image.width(), image.height()) != source_size {
+        let decoded = match image {
+            DecodedRaster::External(decoded) => (decoded.width(), decoded.height()),
+            DecodedRaster::Pixels {
+                width,
+                height,
+                data,
+            } => {
+                let expected = u64::from(*width) * u64::from(*height) * 4;
+                if data.len() as u64 != expected {
+                    return Err(Error::invalid(format!(
+                        "encoded raster {source} carries {} pixel bytes, expected {expected}",
+                        data.len()
+                    )));
+                }
+                (*width, *height)
+            }
+        };
+        if decoded != source_size {
             return Err(Error::invalid(format!(
                 "encoded raster {source} decoded as {}x{}, expected {}x{}",
-                image.width(),
-                image.height(),
-                source_size.0,
-                source_size.1
+                decoded.0, decoded.1, source_size.0, source_size.1
             )));
         }
         let limit = device.limits().max_texture_dimension_2d;
@@ -309,26 +338,55 @@ impl GpuCompositor {
                 height,
                 Some(source),
             );
-            queue.copy_external_image_to_texture(
-                &wgpu::CopyExternalImageSourceInfo {
-                    source: image.clone(),
-                    origin: wgpu::Origin2d { x, y },
-                    flip_y: false,
-                },
-                wgpu::CopyExternalImageDestInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                    color_space: wgpu::PredefinedColorSpace::Srgb,
-                    premultiplied_alpha: true,
-                },
-                wgpu::Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            match image {
+                DecodedRaster::External(decoded) => {
+                    queue.copy_external_image_to_texture(
+                        &wgpu::CopyExternalImageSourceInfo {
+                            source: decoded.clone(),
+                            origin: wgpu::Origin2d { x, y },
+                            flip_y: false,
+                        },
+                        wgpu::CopyExternalImageDestInfo {
+                            texture: &texture.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                            color_space: wgpu::PredefinedColorSpace::Srgb,
+                            premultiplied_alpha: true,
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+                DecodedRaster::Pixels {
+                    width: image_width,
+                    height: image_height,
+                    data,
+                } => {
+                    queue.write_texture(
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &texture.texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d { x, y, z: 0 },
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        data,
+                        wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(*image_width * 4),
+                            rows_per_image: Some(*image_height),
+                        },
+                        wgpu::Extent3d {
+                            width,
+                            height,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                }
+            }
             texture.last_used = self.image_clock;
             if let Some(previous) = self.images.insert(id, texture) {
                 self.image_bytes = self.image_bytes.saturating_sub(previous.byte_len);

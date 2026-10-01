@@ -7,6 +7,8 @@ mod frame;
 mod native;
 mod prepared;
 
+#[cfg(target_arch = "wasm32")]
+pub use compositor::DecodedRaster;
 pub use compositor::{
     CompositionCommand, DEFAULT_RASTER_CACHE_BUDGET_BYTES, GpuCompositor, RasterDraw,
 };

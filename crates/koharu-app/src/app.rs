@@ -80,6 +80,11 @@ pub fn run(context: tauri::Context<CefRuntime>) -> Result<()> {
             ("use-angle", Some("vulkan")),
             ("--ozone-platform", Some("x11")),
         ]);
+    // Windows hides even the software WebGPU adapter unless unsafe WebGPU is
+    // allowed, so drivers without a WebGPU-capable GPU report no adapter at all.
+    // The canvas falls back to CPU pixel uploads on such adapters.
+    #[cfg(target_os = "windows")]
+    let cef = cef.command_line_args([("--enable-unsafe-webgpu", None)]);
     tauri::Builder::<CefRuntime>::new()
         .runtime(cef)
         .plugin(
