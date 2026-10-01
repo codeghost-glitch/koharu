@@ -918,14 +918,14 @@ fn read_raster_pixels(bitmap: &ImageBitmap) -> Result<DecodedRaster, JsValue> {
         .ok_or_else(|| js_message("no document for reading raster pixels"))?;
     let scratch: HtmlCanvasElement = document
         .create_element("canvas")
-        .map_err(js_error)?
+        .map_err(js_call_error)?
         .dyn_into()
         .map_err(|_| js_message("scratch element is not a canvas"))?;
     scratch.set_width(width.max(1));
     scratch.set_height(height.max(1));
     let context = scratch
         .get_context("2d")
-        .map_err(js_error)?
+        .map_err(js_call_error)?
         .ok_or_else(|| js_message("scratch canvas has no 2d context"))?
         .dyn_into::<CanvasRenderingContext2d>()
         .map_err(|_| js_message("scratch 2d context is not a CanvasRenderingContext2d"))?;
@@ -2049,6 +2049,11 @@ async fn next_animation_frame(window: &Window) -> Result<(), JsValue> {
 
 fn js_error(error: impl std::fmt::Display) -> JsValue {
     js_message(error.to_string())
+}
+
+/// Turn a rejected web-sys call into the same error shape as `js_error`.
+fn js_call_error(error: JsValue) -> JsValue {
+    js_message(js_value_message(&error))
 }
 
 fn js_message(message: impl AsRef<str>) -> JsValue {
